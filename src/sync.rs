@@ -1,4 +1,5 @@
 use chrono::{Duration, Utc};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Deserialize;
 
 use crate::cli::CliArgs;
@@ -52,7 +53,19 @@ pub async fn sync_all(args: CliArgs) -> Result<(), GxsyncError> {
         None => load_config().await?.accounts,
     };
 
+    let mp = MultiProgress::new();
+    let total_accounts = accounts.len() as u64;
+    let master_pb = mp.add(ProgressBar::new(total_accounts));
+    master_pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+        )
+        .unwrap()
+        .progress_chars("#>-"),
+    );
+    master_pb.set_message("Syncing accounts");
     for account in accounts {
+        master_pb.set_message(format!("Syncing account {}", account.mailbox));
         let graph = GraphClient::new(&account.auth_profile).await?;
         let include_set = account.include_folders.as_ref().map(|s| {
             s.split(',')
@@ -84,16 +97,12 @@ pub async fn sync_all(args: CliArgs) -> Result<(), GxsyncError> {
                 .unwrap_or(false);
 
             if included && !excluded {
-                tracing::info!(
-                    "Found folder: {} ({} items, {} unread)",
-                    folder.display_name,
-                    folder.total_item_count,
-                    folder.unread_item_count
-                );
-                sync_folder_messages(&graph, &account, &folder, args.dry_run).await?;
+                sync_folder_messages(&graph, &account, &folder, args.dry_run, &mp).await?;
             }
         }
+        master_pb.inc(1);
     }
+    master_pb.finish_with_message("All accounts synced.");
 
     Ok(())
 }
@@ -103,17 +112,13 @@ async fn sync_folder_messages(
     account: &AccountConfig,
     folder: &MailFolder,
     dry_run: bool,
+    mp: &MultiProgress,
 ) -> Result<(), GxsyncError> {
     let since = Utc::now() - Duration::days(account.days as i64);
     let since_iso = since.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let url = format!(
         "https://graph.microsoft.com/v1.0/users/{}/mailFolders/{}/messages?$filter=receivedDateTime ge {}",
         account.mailbox, folder._id, since_iso
-    );
-    tracing::info!(
-        "Fetching messages for `{}` since {}",
-        folder.display_name,
-        since_iso
     );
     let resp = graph.get(&url).send().await?;
     let status = resp.status();
@@ -124,13 +129,17 @@ async fn sync_folder_messages(
         )));
     }
     let list: MessageList = serde_json::from_str(&body)?;
+    let total = list.value.len();
+    let pb = mp.add(ProgressBar::new(total as u64));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    pb.set_message(folder.display_name.clone());
     for msg in list.value {
-        tracing::info!(
-            "Message: [{}] {} @ {}",
-            msg.internet_message_id.as_deref().unwrap_or("<no id>"),
-            msg.subject.as_deref().unwrap_or("<no subject>"),
-            msg.received_date_time
-        );
+        pb.inc(1);
         if dry_run {
             continue;
         }
@@ -145,8 +154,10 @@ async fn sync_folder_messages(
 
         maildir::write_mail(&account.mailbox, &folder.display_name, &msg.id, &mime_data)?;
     }
-
-    tracing::debug!("{} response: {}", folder.display_name, body);
+    pb.finish_with_message(format!(
+        "✅ {:25} / {:30}",
+        account.mailbox, folder.display_name,
+    ));
 
     Ok(())
 }

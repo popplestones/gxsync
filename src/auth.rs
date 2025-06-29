@@ -3,7 +3,6 @@ use std::process::Command;
 use crate::error::GxsyncError;
 
 pub async fn get_access_token(auth_profile: &str) -> Result<String, GxsyncError> {
-    tracing::info!("Running `msoauth --print-token`");
     let output = Command::new("msoauth")
         .arg("--print-token")
         .arg("--profile")
