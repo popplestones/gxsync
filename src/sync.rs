@@ -1,12 +1,15 @@
+use std::path::Path;
+
 use chrono::{Duration, Utc};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Deserialize;
 
 use crate::cli::CliArgs;
 use crate::client::GraphClient;
-use crate::config::{AccountConfig, load_config};
+use crate::config::{AccountConfig, NormalizedAccountConfig, load_config};
 use crate::error::GxsyncError;
 use crate::maildir;
+use crate::sync_state::SyncState;
 
 #[derive(Debug, Deserialize)]
 struct MailFolderList {
@@ -38,19 +41,23 @@ struct Message {
 }
 
 pub async fn sync_all(args: CliArgs) -> Result<(), GxsyncError> {
-    let accounts: Vec<AccountConfig> = match &args.mailbox {
-        Some(mailbox) => vec![AccountConfig {
-            mailbox: mailbox.clone(),
-            target: args
+    let accounts: Vec<NormalizedAccountConfig> = match &args.mailbox {
+        Some(mailbox) => {
+            let target = args
                 .target
                 .clone()
-                .unwrap_or_else(|| format!("~/Mail/{mailbox}")),
-            days: args.days.unwrap_or(30),
-            include_folders: args.include_folders.clone(),
-            exclude_folders: args.exclude_folders.clone(),
-            auth_profile: "default".into(),
-        }],
-        None => load_config().await?.accounts,
+                .unwrap_or_else(|| format!("~/Mail/{mailbox}"));
+            let days = args.days.unwrap_or(30);
+            vec![NormalizedAccountConfig {
+                mailbox: mailbox.clone(),
+                target,
+                days,
+                include_folders: args.include_folders.clone(),
+                exclude_folders: args.exclude_folders.clone(),
+                auth_profile: "default".into(),
+            }]
+        }
+        None => load_config().await?,
     };
 
     let mp = MultiProgress::new();
@@ -65,6 +72,9 @@ pub async fn sync_all(args: CliArgs) -> Result<(), GxsyncError> {
     );
     master_pb.set_message("Syncing accounts");
     for account in accounts {
+        let sync_path =
+            Path::new(&shellexpand::tilde(&account.target).to_string()).join(".gxsync-state");
+        let mut sync_state = SyncState::load(&sync_path)?;
         master_pb.set_message(format!("Syncing account {}", account.mailbox));
         let graph = GraphClient::new(&account.auth_profile).await?;
         let include_set = account.include_folders.as_ref().map(|s| {
@@ -97,9 +107,19 @@ pub async fn sync_all(args: CliArgs) -> Result<(), GxsyncError> {
                 .unwrap_or(false);
 
             if included && !excluded {
-                sync_folder_messages(&graph, &account, &folder, args.dry_run, &mp).await?;
+                sync_folder_messages(
+                    &graph,
+                    &account,
+                    &folder,
+                    args.dry_run,
+                    &mp,
+                    &mut sync_state,
+                )
+                .await?;
             }
         }
+        sync_state.save(&sync_path)?;
+        println!("Saved sync state to {sync_path:?}");
         master_pb.inc(1);
     }
     master_pb.finish_with_message("All accounts synced.");
@@ -109,10 +129,11 @@ pub async fn sync_all(args: CliArgs) -> Result<(), GxsyncError> {
 
 async fn sync_folder_messages(
     graph: &GraphClient,
-    account: &AccountConfig,
+    account: &NormalizedAccountConfig,
     folder: &MailFolder,
     dry_run: bool,
     mp: &MultiProgress,
+    sync_state: &mut SyncState,
 ) -> Result<(), GxsyncError> {
     let since = Utc::now() - Duration::days(account.days as i64);
     let since_iso = since.format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -140,6 +161,11 @@ async fn sync_folder_messages(
     pb.set_message(folder.display_name.clone());
     for msg in list.value {
         pb.inc(1);
+
+        if sync_state.is_synced(&folder.display_name, &msg.id) {
+            continue;
+        }
+
         if dry_run {
             continue;
         }
@@ -153,6 +179,7 @@ async fn sync_folder_messages(
         let mime_data = mime_resp.bytes().await?;
 
         maildir::write_mail(&account.mailbox, &folder.display_name, &msg.id, &mime_data)?;
+        sync_state.mark_synced(&folder.display_name, &msg.id);
     }
     pb.finish_with_message(format!(
         "✅ {:25} / {:30}",

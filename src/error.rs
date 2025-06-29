@@ -16,6 +16,9 @@ pub enum GxsyncError {
     #[error("TOML error: {0}")]
     Toml(#[from] toml::de::Error),
 
+    #[error("State error: {0}")]
+    State(#[from] anyhow::Error),
+
     #[error("Other error: {0}")]
     Other(String),
 }

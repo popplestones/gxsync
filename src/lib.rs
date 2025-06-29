@@ -5,6 +5,7 @@ pub mod config;
 pub mod error;
 pub mod maildir;
 pub mod sync;
+pub mod sync_state;
 
 use crate::cli::CliArgs;
 
